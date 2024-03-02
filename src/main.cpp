@@ -63,8 +63,10 @@
     fifoOutOfstream.close();
   }
 
-  extern "C"
-  JNIEXPORT jint JNICALL
+  extern "C" JNIEXPORT void JNICALL
+  Java_com_jjassistant_OpenWakeWordService_endOpenWakeWord() { end(); }
+
+  extern "C" JNIEXPORT jint JNICALL
   Java_com_jjassistant_OpenWakeWordService_openWakeWord(
     JNIEnv *env, jobject instance, jobject assetManager,
     jobject options, jint deviceId, jstring fifoInFileName, jstring fifoOutFileName

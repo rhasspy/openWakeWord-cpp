@@ -16,9 +16,12 @@ import android.content.pm.ServiceInfo;
 
 import androidx.core.app.NotificationCompat;
 import androidx.annotation.Nullable;
+import androidx.work.ExistingPeriodicWorkPolicy;
+import androidx.work.PeriodicWorkRequest;
 import androidx.work.WorkManager;
 
 import java.util.Date;
+import java.util.concurrent.TimeUnit;
 import java.util.HashMap;
 import java.util.Map;
 import java.lang.Thread;
@@ -74,6 +77,8 @@ public class OpenWakeWordServiceExample extends Service {
         String fifoOutFileName
     );
 
+    public static native void endOpenWakeWord();
+
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
 
@@ -83,13 +88,12 @@ public class OpenWakeWordServiceExample extends Service {
 
         if (extras.getString("end") != null) {
             ending = true;
-            WorkManager.getInstance(this).cancelUniqueWork(workerID);
             stopSelf();
             return Service.START_REDELIVER_INTENT;
         }
 
         if (isRunning.equals(true)) {
-            openWakeWordStart(Integer.valueOf(extras.getString("delayMS", "0")));
+            cppStart(Integer.valueOf(extras.getString("delayMS", "0")));
             return Service.START_REDELIVER_INTENT;
         }
 
@@ -108,7 +112,6 @@ public class OpenWakeWordServiceExample extends Service {
         
             Log.d("~= OpenWakeWordService", "onStartCommand - keyword: " + keyword + ", sensitivity: " + sensitivity);
 
-            // TODO: Don't forget to create first NotificationChannel in MainActivity !
             NotificationCompat.Builder notification = new NotificationCompat.Builder(this, workerID)
                 .setAutoCancel(false)
                 .setSmallIcon(R.drawable.ic_launcher_foreground)
@@ -120,6 +123,12 @@ public class OpenWakeWordServiceExample extends Service {
                 type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE;
             }
             startForeground(99, notification.build(), type);
+
+            WorkManager.getInstance(this).enqueueUniquePeriodicWork(
+                workerID,
+                ExistingPeriodicWorkPolicy.KEEP,
+                new PeriodicWorkRequest.Builder(OpenWakeWorkWorkerExample.class, 16 /* minimal minutes by documentation */, TimeUnit.MINUTES).build()
+            );
 
             new File(fifoOutFileName).delete();
 
@@ -175,15 +184,15 @@ public class OpenWakeWordServiceExample extends Service {
             opts.end_after_activation = endAfterActivation;
             opts.trigger_level = "1";
 
-            openWakeWordStart();
+            cppStart();
         }
 
         // by returning this we make sure the service is restarted if the system kills the service
         return Service.START_STICKY;
     }
 
-    public void openWakeWordStart() { openWakeWordStart(0); }
-    public void openWakeWordStart(int delayMS) {
+    public void cppStart() { cppStart(0); }
+    public void cppStart(int delayMS) {
         mgr = getResources().getAssets();
 
         if (cppIsRunning) return;
@@ -220,13 +229,20 @@ public class OpenWakeWordServiceExample extends Service {
     public void onDestroy() {
         Log.d("~= OpenWakeWordService", "onDestroy");
 
+        endOpenWakeWord();
+
         isRunning = false;
+        cppIsRunning = false;
 
         stopForeground(true);
 
         // Android destroy service automaticly after same time.
         // Android not need call this onDestroy(), that's why you must set worker, which will call this service each 16 minutes.
-        ... TODO: there call this service again
+        if (ending == false) {
+            ... TODO: there call this service again
+        } else {
+            try { WorkManager.getInstance(this).cancelUniqueWork(workerID); } catch (Exception e) {}
+        }
 
         super.onDestroy();
     }
