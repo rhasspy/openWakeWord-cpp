@@ -11,6 +11,153 @@
 
 #include <onnxruntime_cxx_api.h>
 
+#ifdef __ANDROID__
+
+  #include <jni.h>
+  #include <aaudio/AAudio.h>
+  #define LOG_TAG "c++" // the tag to be shown in logcat
+  #include <android/log.h>
+  #include <unistd.h>
+  #include <fcntl.h>
+  #include <sys/stat.h>
+  #include <sys/types.h>
+  #include <string.h>
+  #include <fstream>
+  #include <android/asset_manager.h>
+  #include <android/asset_manager_jni.h>
+  #include "main.h"
+
+  FILE *stdin;
+  std::ofstream fifoOutOfstream;
+  int fifoIn;
+  int fifoOut;
+  AAssetManager *mgr;
+  AAudioStream *stream;
+  bool end_after_activation = false;
+
+  aaudio_data_callback_result_t aaudioMicCallback(
+    AAudioStream *stream,
+    void *userData,
+    void *audioData,
+    int32_t numFrames
+  ) {
+    int16_t *samples = static_cast<int16_t*>(audioData);
+    write(fifoIn, samples, numFrames * sizeof(int16_t));
+    return AAUDIO_CALLBACK_RESULT_CONTINUE;
+  }
+
+  off_t getAssset(char** bits, const char* filename) {
+    AAsset *asset = AAssetManager_open(mgr, filename, AASSET_MODE_UNKNOWN);
+    off_t size = AAsset_getLength(asset);
+    __android_log_print(ANDROID_LOG_DEBUG, "~= c++", "size of app/src/main/assets/%s: %ld", filename, size);
+    *bits = new char[size];
+    AAsset_read(asset, *bits, size);
+    AAsset_close(asset);
+    return size;
+  }
+
+  void end() {
+    AAudioStream_close(stream);
+    close(fifoIn);
+    fclose(stdin);
+    fifoOutOfstream.close();
+  }
+
+  extern "C" JNIEXPORT void JNICALL
+  Java_com_jjassistant_OpenWakeWordService_endOpenWakeWord() { end(); }
+
+  extern "C" JNIEXPORT jint JNICALL
+  Java_com_jjassistant_OpenWakeWordService_openWakeWord(
+    JNIEnv *env, jobject instance, jobject assetManager,
+    jobject options, jint deviceId, jstring fifoInFileName, jstring fifoOutFileName
+  ) {
+    mgr = AAssetManager_fromJava(env, assetManager);
+
+    char *fifoInFileName2 = (char*)env->GetStringUTFChars(fifoInFileName, 0);
+    char *fifoOutFileName2 = (char*)env->GetStringUTFChars(fifoOutFileName, 0);
+    int deviceId2 = (int)deviceId;
+
+    jclass optionsClass = env->GetObjectClass(options);
+
+    jstring modelObj                = (jstring)env->GetObjectField(options, env->GetFieldID(optionsClass, "model",                "Ljava/lang/String;"));
+    jstring thresholdObj            = (jstring)env->GetObjectField(options, env->GetFieldID(optionsClass, "threshold",            "Ljava/lang/String;"));
+    jstring trigger_levelObj        = (jstring)env->GetObjectField(options, env->GetFieldID(optionsClass, "trigger_level",        "Ljava/lang/String;"));
+    jstring refractoryObj           = (jstring)env->GetObjectField(options, env->GetFieldID(optionsClass, "refractory",           "Ljava/lang/String;"));
+    jstring step_framesObj          = (jstring)env->GetObjectField(options, env->GetFieldID(optionsClass, "step_frames",          "Ljava/lang/String;"));
+    jstring melspectrogram_modelObj = (jstring)env->GetObjectField(options, env->GetFieldID(optionsClass, "melspectrogram_model", "Ljava/lang/String;"));
+    jstring embedding_modelObj      = (jstring)env->GetObjectField(options, env->GetFieldID(optionsClass, "embedding_model",      "Ljava/lang/String;"));
+    jstring debugObj                = (jstring)env->GetObjectField(options, env->GetFieldID(optionsClass, "debug",                "Ljava/lang/String;"));
+    bool end_after_activationObj    = env->GetBooleanField(options, env->GetFieldID(optionsClass, "end_after_activation", "Z"));
+    char *model                = (modelObj                == NULL) ? (char*)"-" : (char*)env->GetStringUTFChars(modelObj, 0);
+    char *threshold            = (thresholdObj            == NULL) ? (char*)"-" : (char*)env->GetStringUTFChars(thresholdObj, 0);
+    char *trigger_level        = (trigger_levelObj        == NULL) ? (char*)"-" : (char*)env->GetStringUTFChars(trigger_levelObj, 0);
+    char *refractory           = (refractoryObj           == NULL) ? (char*)"-" : (char*)env->GetStringUTFChars(refractoryObj, 0);
+    char *step_frames          = (step_framesObj          == NULL) ? (char*)"-" : (char*)env->GetStringUTFChars(step_framesObj, 0);
+    char *melspectrogram_model = (melspectrogram_modelObj == NULL) ? (char*)"-" : (char*)env->GetStringUTFChars(melspectrogram_modelObj, 0);
+    char *embedding_model      = (embedding_modelObj      == NULL) ? (char*)"-" : (char*)env->GetStringUTFChars(embedding_modelObj, 0);
+    char *debug                = (debugObj                == NULL) ? (char*)"-" : (char*)env->GetStringUTFChars(debugObj, 0);
+         end_after_activation  = (end_after_activationObj != true) ? false      : true;
+
+    AAudioStreamBuilder *builder;
+    aaudio_result_t result = AAudio_createStreamBuilder(&builder);
+
+    AAudioStreamBuilder_setDeviceId(builder, deviceId2);
+    AAudioStreamBuilder_setDirection(builder, AAUDIO_DIRECTION_INPUT);
+    AAudioStreamBuilder_setSampleRate(builder, 16000);
+    AAudioStreamBuilder_setSharingMode(builder, AAUDIO_SHARING_MODE_SHARED);
+    AAudioStreamBuilder_setChannelCount(builder, 1);
+    AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_I16);
+    AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_POWER_SAVING); // AAUDIO_PERFORMANCE_MODE_LOW_LATENCY
+    AAudioStreamBuilder_setDataCallback(builder, aaudioMicCallback, nullptr);
+    // AAudioStreamBuilder_setBufferCapacityInFrames(builder, sizeof(int16_t));
+    // AAudioStreamBuilder_setBufferCapacityInFrames(builder, frames);
+
+    AAudioStreamBuilder_openStream(builder, &stream);
+    AAudioStreamBuilder_delete(builder);
+
+    // unlink(fifoOutFileName2); // remove in java
+    fifoOutOfstream.open(fifoOutFileName2, std::ofstream::out | std::ofstream::app);
+    std::cerr.rdbuf(fifoOutOfstream.rdbuf());
+    std::cout.rdbuf(fifoOutOfstream.rdbuf());
+
+    unlink(fifoInFileName2);
+    int fifoInCode = mkfifo(fifoInFileName2, 0666);
+    fifoIn = open(fifoInFileName2, O_RDWR); // O_RDONLY // O_RDWR | O_NONBLOCK
+    stdin = fopen(fifoInFileName2, "rb");
+    if (fifoInCode == -1 || fifoIn == -1) {
+      std::cerr << "[ERROR] fifoIn open error: " << strerror(errno) << std::endl;
+      return -1;
+    }
+
+    AAudioStream_requestStart(stream);
+
+    char *argv[] = {(char*)"/",
+      (strcmp(model                , "-") == 0) ? (char*)"-" : (char*)"--model", model,
+      (strcmp(threshold            , "-") == 0) ? (char*)"-" : (char*)"--threshold", threshold,
+      (strcmp(trigger_level        , "-") == 0) ? (char*)"-" : (char*)"--trigger-level", trigger_level,
+      (strcmp(refractory           , "-") == 0) ? (char*)"-" : (char*)"--refractory", refractory,
+      (strcmp(step_frames          , "-") == 0) ? (char*)"-" : (char*)"--step-frames", step_frames,
+      (strcmp(melspectrogram_model , "-") == 0) ? (char*)"-" : (char*)"--melspectrogram-model", melspectrogram_model,
+      (strcmp(embedding_model      , "-") == 0) ? (char*)"-" : (char*)"--embedding-model", embedding_model,
+      (strcmp(debug                , "-") == 0) ? (char*)"-" : (char*)"--debug"
+    };
+
+    main(16, argv);
+
+    if (modelObj                != NULL) env->ReleaseStringUTFChars(modelObj, model);
+    if (thresholdObj            != NULL) env->ReleaseStringUTFChars(thresholdObj, threshold);
+    if (trigger_levelObj        != NULL) env->ReleaseStringUTFChars(trigger_levelObj, trigger_level);
+    if (refractoryObj           != NULL) env->ReleaseStringUTFChars(refractoryObj, refractory);
+    if (step_framesObj          != NULL) env->ReleaseStringUTFChars(step_framesObj, step_frames);
+    if (melspectrogram_modelObj != NULL) env->ReleaseStringUTFChars(melspectrogram_modelObj, melspectrogram_model);
+    if (embedding_modelObj      != NULL) env->ReleaseStringUTFChars(embedding_modelObj, embedding_model);
+    if (debugObj                != NULL) env->ReleaseStringUTFChars(debugObj, debug);
+
+    std::cerr << "openWakeWord END" << std::endl;
+    return 0;
+  }
+#endif
+
 using namespace std;
 using namespace filesystem;
 
@@ -75,8 +222,12 @@ void audioToMels(Settings &settings, State &state, vector<float> &samplesIn,
   auto memoryInfo = Ort::MemoryInfo::CreateCpu(
       OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
 
-  auto melSession =
-      Ort::Session(state.env, settings.melModelPath.c_str(), settings.options);
+  #ifdef __ANDROID__
+    char *bits; off_t size = getAssset(&bits, settings.melModelPath.c_str());
+    auto melSession = Ort::Session(state.env, bits, size, settings.options);
+  #else
+    auto melSession = Ort::Session(state.env, settings.melModelPath.c_str(), settings.options);
+  #endif
 
   vector<int64_t> samplesShape{1, (int64_t)settings.frameSize};
 
@@ -155,8 +306,12 @@ void melsToFeatures(Settings &settings, State &state, vector<float> &melsIn,
   auto memoryInfo = Ort::MemoryInfo::CreateCpu(
       OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
 
-  auto embSession =
-      Ort::Session(state.env, settings.embModelPath.c_str(), settings.options);
+  #ifdef __ANDROID__
+    char *bits; off_t size = getAssset(&bits, settings.embModelPath.c_str());
+    auto embSession = Ort::Session(state.env, bits, size, settings.options);
+  #else
+    auto embSession = Ort::Session(state.env, settings.embModelPath.c_str(), settings.options);
+  #endif
 
   vector<int64_t> embShape{1, (int64_t)embWindowSize, (int64_t)numMels, 1};
 
@@ -239,8 +394,13 @@ void featuresToOutput(Settings &settings, State &state, size_t wwIdx,
 
   auto wwModelPath = settings.wwModelPaths[wwIdx];
   auto wwName = wwModelPath.stem();
-  auto wwSession =
-      Ort::Session(state.env, wwModelPath.c_str(), settings.options);
+
+  #ifdef __ANDROID__
+    char *bits; off_t size = getAssset(&bits, wwModelPath.c_str());
+    auto wwSession = Ort::Session(state.env, bits, size, settings.options);
+  #else
+    auto wwSession = Ort::Session(state.env, wwModelPath.c_str(), settings.options);
+  #endif
 
   vector<int64_t> wwShape{1, (int64_t)wwFeatures, (int64_t)embFeatures};
 
@@ -305,6 +465,10 @@ void featuresToOutput(Settings &settings, State &state, size_t wwIdx,
           }
         }
 
+        if (probability > 0.1) {
+          cerr << activation + 1 << " >= " << settings.triggerLevel << " (triggerLevel) && "
+               << probability << " > " << settings.threshold << " (threshold)" << endl;
+        }
         if (probability > settings.threshold) {
           // Activated
           activation++;
@@ -313,6 +477,10 @@ void featuresToOutput(Settings &settings, State &state, size_t wwIdx,
             {
               unique_lock lockOutput(state.mutOutput);
               cout << wwName << endl;
+
+              #ifdef __ANDROID__
+                if (end_after_activation == true) end();
+              #endif
             }
             activation = -settings.refractory;
           }
@@ -338,8 +506,10 @@ void featuresToOutput(Settings &settings, State &state, size_t wwIdx,
 
 int main(int argc, char *argv[]) {
 
-  // Re-open stdin/stdout in binary mode
-  freopen(NULL, "rb", stdin);
+  #ifndef __ANDROID__
+    // Re-open stdin/stdout in binary mode
+    freopen(NULL, "rb", stdin);
+  #endif
 
   Settings settings;
 
